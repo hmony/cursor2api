@@ -175,10 +175,12 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
         combinedSystem = combinedSystem.replace(/^x-anthropic-billing-header[^\n]*$/gim, '');
         combinedSystem = combinedSystem.replace(/\n{3,}/g, '\n\n').trim();
     }
-
-    // ★ Thinking 提示注入：当客户端请求 thinking 时，引导模型使用 <thinking> 标签
-    if (req.thinking?.type === 'enabled') {
-        const thinkingHint = '\n\nBefore responding, think through the problem step by step inside <thinking>...</thinking> tags. Your thinking will be extracted and returned separately. After thinking, provide your actual response outside the tags.';
+    // ★ Thinking 提示注入：根据是否有工具选择不同的注入位置
+    // 有工具时：放在工具指令末尾（不会被工具定义覆盖，模型更容易注意）
+    // 无工具时：放在系统提示词末尾（原有行为，已验证有效）
+    const thinkingEnabled = req.thinking?.type === 'enabled' || req.thinking?.type === 'adaptive';
+    const thinkingHint = '\n\n**IMPORTANT**: Before your response, you MUST first think through the problem step by step inside <thinking>...</thinking> tags. Your thinking process will be extracted and shown separately. After the closing </thinking> tag, provide your actual response or actions.';
+    if (thinkingEnabled && !hasTools) {
         combinedSystem = (combinedSystem || '') + thinkingHint;
     }
 
@@ -188,6 +190,11 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
 
         const hasCommunicationTool = tools.some(t => ['attempt_completion', 'ask_followup_question', 'AskFollowupQuestion'].includes(t.name));
         let toolInstructions = buildToolInstructions(tools, hasCommunicationTool, toolChoice);
+
+        // ★ 有工具时：thinking 提示放在工具指令末尾（模型注意力最强的位置之一）
+        if (thinkingEnabled) {
+            toolInstructions += thinkingHint;
+        }
 
         // 系统提示词与工具指令合并
         toolInstructions = combinedSystem + '\n\n---\n\n' + toolInstructions;
@@ -214,8 +221,14 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
             id: shortId(),
             role: 'user',
         });
+        // ★ 当 thinking 启用时，few-shot 示例也包含 <thinking> 标签
+        // few-shot 是让模型遵循输出格式最强力的手段
+        const fewShotAction = `\`\`\`json action\n${JSON.stringify({ tool: fewShotTool.name, parameters: fewShotParams }, null, 2)}\n\`\`\``;
+        const fewShotResponse = thinkingEnabled
+            ? `<thinking>\nThe user wants me to help with their project. I should start by examining the project structure to understand what we're working with.\n</thinking>\n\nLet me start by examining the project structure.\n\n${fewShotAction}`
+            : `Understood. I'll use the structured format for actions. Here's how I'll respond:\n\n${fewShotAction}`;
         messages.push({
-            parts: [{ type: 'text', text: `Understood. I'll use the structured format for actions. Here's how I'll respond:\n\n\`\`\`json action\n${JSON.stringify({ tool: fewShotTool.name, parameters: fewShotParams }, null, 2)}\n\`\`\`` }],
+            parts: [{ type: 'text', text: fewShotResponse }],
             id: shortId(),
             role: 'assistant',
         });
@@ -270,7 +283,12 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
 
                 actualQuery = actualQuery.trim();
 
-                let wrapped = `${actualQuery}\n\nRespond with the appropriate action using the structured format.`;
+                // ★ 判断是否是最后一条用户消息（模型即将回答的那条）
+                const isLastUserMsg = !req.messages.slice(i + 1).some(m => m.role === 'user');
+                const thinkingSuffix = (thinkingEnabled && isLastUserMsg)
+                    ? '\n\nFirst, think step by step inside <thinking>...</thinking> tags. Then respond with the appropriate action using the structured format.'
+                    : '\n\nRespond with the appropriate action using the structured format.';
+                let wrapped = `${actualQuery}${thinkingSuffix}`;
 
                 if (tagsPrefix) {
                     text = `${tagsPrefix}\n${wrapped}`;

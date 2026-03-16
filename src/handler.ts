@@ -444,15 +444,23 @@ export async function handleMessages(req: Request, res: Response): Promise<void>
         // 转换为 Cursor 请求
         log.startPhase('convert', '格式转换');
         log.info('Handler', 'convert', '开始转换为 Cursor 请求格式');
+        // ★ 区分客户端 thinking 模式：
+        // - enabled: GUI 插件，支持渲染 thinking content block
+        // - adaptive: Claude Code，需要密码学 signature 验证，无法伪造 → 保留标签在正文中
+        const clientRequestedThinking = body.thinking?.type === 'enabled';
+        // ★ Thinking 默认启用：Claude Code 等客户端可能不传 thinking 参数，proxy 层自动补上
+        if (!body.thinking) {
+            body.thinking = { type: 'enabled' };
+        }
         const cursorReq = await convertToCursorRequest(body);
         log.endPhase();
         log.recordCursorRequest(cursorReq);
-        log.debug('Handler', 'convert', `转换完成: ${cursorReq.messages.length} messages, model=${cursorReq.model}`);
+        log.debug('Handler', 'convert', `转换完成: ${cursorReq.messages.length} messages, model=${cursorReq.model}, clientThinking=${clientRequestedThinking}, thinkingType=${body.thinking?.type}`);
 
         if (body.stream) {
-            await handleStream(res, cursorReq, body, log);
+            await handleStream(res, cursorReq, body, log, clientRequestedThinking);
         } else {
-            await handleNonStream(res, cursorReq, body, log);
+            await handleNonStream(res, cursorReq, body, log, clientRequestedThinking);
         }
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
@@ -616,7 +624,7 @@ export function buildRetryRequest(body: AnthropicRequest, attempt: number): Anth
 
 // ==================== 流式处理 ====================
 
-async function handleStream(res: Response, cursorReq: CursorChatRequest, body: AnthropicRequest, log: RequestLogger): Promise<void> {
+async function handleStream(res: Response, cursorReq: CursorChatRequest, body: AnthropicRequest, log: RequestLogger, clientRequestedThinking: boolean = false): Promise<void> {
     // 设置 SSE headers
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -681,16 +689,21 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         });
 
         // ★ Thinking 提取（在拒绝检测之前，防止 thinking 内容触发 isRefusal 误判）
-        const thinkingEnabled = body.thinking?.type === 'enabled';
         let thinkingContent = '';
         if (fullResponse.includes('<thinking>')) {
             const thinkingMatch = fullResponse.match(/<thinking>([\s\S]*?)<\/thinking>/g);
             if (thinkingMatch) {
                 thinkingContent = thinkingMatch.map(m => m.replace(/<\/?thinking>/g, '').trim()).join('\n\n');
-                fullResponse = fullResponse.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '').trim();
-                log.info('Handler', 'thinking', `剥离 thinking: ${thinkingContent.length} chars, 剩余 ${fullResponse.length} chars`);
                 log.recordThinking(thinkingContent);
                 log.updateSummary({ thinkingChars: thinkingContent.length });
+                if (clientRequestedThinking) {
+                    // 客户端原生请求 thinking → 剥离标签，稍后发送 thinking content block
+                    fullResponse = fullResponse.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '').trim();
+                    log.info('Handler', 'thinking', `剥离 thinking → content block: ${thinkingContent.length} chars, 剩余 ${fullResponse.length} chars`);
+                } else {
+                    // proxy 注入的 thinking → 保留标签在正文中，Claude Code 可直接显示
+                    log.info('Handler', 'thinking', `保留 thinking 在正文中 (非客户端请求): ${thinkingContent.length} chars`);
+                }
             }
         }
 
@@ -729,10 +742,11 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
             }
         }
 
-        // 极短响应重试（可能是连接中断）
-        if (hasTools && fullResponse.trim().length < 10 && retryCount < MAX_REFUSAL_RETRIES) {
+        // 极短响应重试（仅在响应几乎为空时触发，避免误判正常短回答如 "2" 或 "25岁"）
+        const trimmed = fullResponse.trim();
+        if (hasTools && trimmed.length < 3 && !trimmed.match(/\d/) && retryCount < MAX_REFUSAL_RETRIES) {
             retryCount++;
-            log.warn('Handler', 'retry', `响应过短 (${fullResponse.length} chars)，重试第${retryCount}次`);
+            log.warn('Handler', 'retry', `响应过短 (${fullResponse.length} chars: "${trimmed}")，重试第${retryCount}次`);
             activeCursorReq = await convertToCursorRequest(body);
             await executeStream();
             log.info('Handler', 'retry', `重试响应: ${fullResponse.length} chars`, { preview: fullResponse.substring(0, 200) });
@@ -835,9 +849,10 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             log.warn('Handler', 'truncation', `${MAX_AUTO_CONTINUE}次续写后仍截断 (${fullResponse.length} chars) → stop_reason=max_tokens`);
         }
 
-        // ★ Thinking 块发送：在实际内容之前发送 thinking content block
+        // ★ Thinking 块发送：仅 GUI 插件（enabled）才发 thinking content block
+        // Claude Code（adaptive）需要密码学 signature 验证，无法伪造，所以保留标签在正文中
         log.startPhase('stream', 'SSE 输出');
-        if (thinkingEnabled && thinkingContent) {
+        if (clientRequestedThinking && thinkingContent) {
             writeSSE(res, 'content_block_start', {
                 type: 'content_block_start', index: blockIndex,
                 content_block: { type: 'thinking', thinking: '' },
@@ -1038,7 +1053,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
 
 // ==================== 非流式处理 ====================
 
-async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body: AnthropicRequest, log: RequestLogger): Promise<void> {
+async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body: AnthropicRequest, log: RequestLogger, clientRequestedThinking: boolean = false): Promise<void> {
     // ★ 非流式保活：手动设置 chunked 响应，在缓冲期间每 15s 发送空白字符保活
     // JSON.parse 会忽略前导空白，所以客户端解析不受影响
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1068,14 +1083,17 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     });
 
     // ★ Thinking 提取（在拒绝检测之前）
-    const thinkingEnabled = body.thinking?.type === 'enabled';
     let thinkingContent = '';
     if (fullText.includes('<thinking>')) {
         const thinkingMatch = fullText.match(/<thinking>([\s\S]*?)<\/thinking>/g);
         if (thinkingMatch) {
             thinkingContent = thinkingMatch.map(m => m.replace(/<\/?thinking>/g, '').trim()).join('\n\n');
-            fullText = fullText.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '').trim();
-            log.info('Handler', 'thinking', `非流式剥离 thinking: ${thinkingContent.length} chars, 剩余 ${fullText.length} chars`);
+            if (clientRequestedThinking) {
+                fullText = fullText.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '').trim();
+                log.info('Handler', 'thinking', `非流式剥离 thinking → content block: ${thinkingContent.length} chars, 剩余 ${fullText.length} chars`);
+            } else {
+                log.info('Handler', 'thinking', `非流式保留 thinking 在正文中: ${thinkingContent.length} chars`);
+            }
         }
     }
 
@@ -1198,8 +1216,8 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
 
     const contentBlocks: AnthropicContentBlock[] = [];
 
-    // ★ Thinking 内容作为第一个 content block
-    if (thinkingEnabled && thinkingContent) {
+    // ★ Thinking 内容作为第一个 content block（仅客户端原生请求时）
+    if (clientRequestedThinking && thinkingContent) {
         contentBlocks.push({ type: 'thinking' as any, thinking: thinkingContent } as any);
     }
 

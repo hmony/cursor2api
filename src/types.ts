@@ -11,7 +11,7 @@ export interface AnthropicRequest {
     temperature?: number;
     top_p?: number;
     stop_sequences?: string[];
-    thinking?: { type: 'enabled' | 'disabled'; budget_tokens?: number };
+    thinking?: { type: 'enabled' | 'disabled' | 'adaptive'; budget_tokens?: number };
 }
 
 /** tool_choice 控制模型是否必须调用工具
